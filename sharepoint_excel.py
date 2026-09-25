@@ -199,7 +199,7 @@ class SharePointSheetAppender:
             if last >= 2:
                 resp = client.get(f"{self._ws(client)}/range(address='A2:A{last}')?$select=values")
                 resp.raise_for_status()
-                matches = [i + 2 for i, (v,) in enumerate(resp.json()["values"]) if v == key]
+                matches = [i + 2 for i, (v,) in enumerate(resp.json()["values"]) if self._same(v, key)]
             # Delete matching runs of rows bottom-up so earlier row numbers stay valid.
             runs: list[list[int]] = []
             for r in matches:
@@ -225,6 +225,14 @@ class SharePointSheetAppender:
                 body["numberFormat"] = [self._number_formats] * len(rows)
             client.patch(f"{self._ws(client)}/range(address='{address}')", json=body).raise_for_status()
             return first, len(matches)
+
+    @staticmethod
+    def _same(cell, key) -> bool:
+        # Excel keeps 15 significant digits, so a date-time serial read back can
+        # differ from the one written in the last places.
+        if isinstance(cell, (int, float)) and isinstance(key, (int, float)):
+            return abs(cell - key) < 1e-6
+        return cell == key
 
     @staticmethod
     def _col_index(letters: str) -> int:

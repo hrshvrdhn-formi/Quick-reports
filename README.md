@@ -15,18 +15,19 @@ Each run adds one row (a new column for `redial`) with an IST timestamp.
 
 ## Cost tracker
 
-Daily voice-call cost by agent (yesterday, IST) from `voice_call_metrics`
-(Metabase question 56 on the Production database) goes to the Cost tracker
-workbook, sheet **Daily Cost**, one row per agent plus TOTAL. It runs outside
-this service, as a scheduled job:
+Per-agent voice-call cost from `voice_call_metrics` (Metabase Production
+database) goes to the Cost Tracker workbook, one row per agent with calls:
 
-```bash
-python cost_tracker.py push     # needs METABASE_API_KEY and app-only AZURE_* credentials
-```
+| Command | Metabase question | Sheet | Period |
+|---|---|---|---|
+| `python cost_tracker.py push hourly` | 57 | Per 1 hour | last full IST hour; run at the top of each hour |
+| `python cost_tracker.py push daily` | 58 | Per day | yesterday (IST); run each morning |
 
-Re-running replaces that day's rows. `cost_tracker.py` also creates/updates the
-Metabase question (`card`) and prints its rows (`preview`). A Power Automate
-alternative is in [`power_automate/`](power_automate/README.md).
+"Connected" means the customer spoke. Per-interaction costs are all calls' cost
+divided by connected interactions, and INR uses `USD_INR_RATE` (default 96.0).
+Re-running a period replaces its rows. `cards` creates/updates the questions from
+the SQL in `cost_tracker.py`, and `preview hourly|daily` prints the rows without
+writing. These run as scheduled jobs outside this service.
 
 ## Endpoints
 

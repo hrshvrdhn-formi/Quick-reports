@@ -1,19 +1,26 @@
-"""Daily voice-call cost by agent, as a saved Metabase question.
+"""Cost tracker: per-agent voice-call cost for the last hour and the last day.
 
-Every morning the question's rows go into the Cost tracker workbook, either via
-`push` below (run on a schedule) or via the Power Automate flow in
-power_automate/README.md. This file holds the SQL and a small CLI:
+Two saved Metabase questions over voice_call_metrics (Production database) feed
+the two sheets of the Cost Tracker workbook, one row per agent that had calls:
 
-    export METABASE_API_KEY=mb_...
-    python cost_tracker.py card [--database 2] [--collection <id>]
-    python cost_tracker.py preview [<card id>]
-    python cost_tracker.py push [<card id>]     # also needs the AZURE_* vars, see sharepoint_excel.py
+  * "Per 1 hour": the last full IST hour; run at the top of every hour
+  * "Per day":    yesterday (IST); run once each morning
+
+"Connected" means the customer spoke (is_zero_utterance is false and the call
+has a duration). Per-interaction costs spread the cost of every call, connected
+or not, over the connected interactions. INR = USD x USD_INR_RATE.
+
+    export METABASE_API_KEY=mb_...          # push also needs AZURE_*, see sharepoint_excel.py
+    python cost_tracker.py cards            # create/update both Metabase questions
+    python cost_tracker.py preview hourly   # or daily: print what push would write
+    python cost_tracker.py push hourly      # or daily; re-running replaces that period's rows
 """
 import argparse
 import json
 import os
 import sys
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime
 
 import httpx
 
@@ -21,142 +28,184 @@ from sharepoint_excel import SharePointSheetAppender
 
 METABASE_URL = os.getenv("METABASE_URL", "https://metabase-internal.formi.co.in")
 COST_DATABASE_ID = 2  # "Production", where voice_call_metrics lives
-
-CARD_NAME = "Voice cost by agent - yesterday (IST)"
-COST_CARD_ID = 56  # CARD_NAME on metabase-internal
+USD_INR_RATE = float(os.getenv("USD_INR_RATE", "96.0"))
 
 COST_TRACKER_URL = (
     "https://agenticuniverse-my.sharepoint.com/:x:/g/personal/harshavardhan_agenticuniverse_ai/"
     "IQBA8JWWiympRbBPDvSSLK2rAcaxxFXRUAjMHGlHPckptdc"
 )
-COST_WORKSHEET = "Daily Cost"
-PULLED_AT = "Pulled At (IST)"
 
-# Sheet header -> result column, with its number format. Keep in step with
-# power_automate/VoiceCostTracker.ts.
-COST_COLUMNS = [
-    ("Date", "report_date", "yyyy-mm-dd"),
-    ("Agent", "agent", "General"),
-    ("Calls", "calls", "0"),
-    ("Minutes", "minutes", "0.00"),
-    ("Token Coverage %", "token_coverage_pct", "0.0"),
-    ("LLM USD", "llm_usd", "0.0000"),
-    ("LLM Cache Storage USD", "llm_cache_storage_usd", "0.0000"),
-    ("TTS USD", "tts_usd", "0.0000"),
-    ("STT USD", "stt_usd", "0.0000"),
-    ("Telephony USD", "telephony_usd", "0.0000"),
-    ("Total USD", "total_usd", "0.0000"),
-    ("Cost per Call USD", "cost_per_call_usd", "0.0000"),
-    ("Cost per Minute USD", "cost_per_minute_usd", "0.0000"),
-    ("Total Stored USD", "total_stored_usd", "0.0000"),
-    ("Drift USD", "drift_usd", "0.000000"),
-    ("Unpriced Services", "unpriced_services", "0"),
-]
-
-IST = timezone(timedelta(hours=5, minutes=30))
-EXCEL_EPOCH = datetime(1899, 12, 30)
-
-# Yesterday (IST midnight to midnight) from voice_call_metrics, one row per
-# agent plus a TOTAL row last. report_date tags every row with the day covered.
-# Calls with no agent_id are grouped under '(no agent_id)'.
-COST_BY_AGENT_SQL = """
+# One row per agent for the IST period [{from_ist}, {to_ist}), both
+# `timestamp without time zone` expressions in IST.
+METRICS_SQL = """
 WITH params AS (
-    SELECT (date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 day') AT TIME ZONE 'Asia/Kolkata' AS t_from,
-           (date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata'))                    AT TIME ZONE 'Asia/Kolkata' AS t_to
+    SELECT {from_ist} AS from_ist,
+           {to_ist}   AS to_ist
 ),
-per_agent AS (
+calls AS (
     SELECT
         m.agent_id,
-        COALESCE(m.agent_id || ' - ' || COALESCE(a.name, '?'), '(no agent_id)') AS agent,
-        COUNT(*)                                                              AS calls,
-        SUM(COALESCE(m.exotel_call_duration_s, m.total_call_ms / 1000.0, 0)) / 60.0 AS minutes,
-        100.0 * COUNT(*) FILTER (WHERE m.llm_token_usage_source = 'actual')
-              / NULLIF(COUNT(*), 0)                                           AS token_coverage_pct,
-        SUM(COALESCE(m.llm_cost_usd, 0))                                      AS llm_usd,
-        SUM(COALESCE(m.llm_cache_storage_cost_usd, 0))                        AS llm_cache_storage_usd,
-        SUM(COALESCE(m.tts_cost_usd, 0))                                      AS tts_usd,
-        SUM(COALESCE(m.stt_cost_usd, 0))                                      AS stt_usd,
-        SUM(COALESCE(m.exotel_cost_usd, 0))                                   AS telephony_usd,
-        SUM(COALESCE(m.total_cost_usd, 0))                                    AS total_stored_usd,
-        (bool_or(m.llm_cost_usd IS NULL))::int
-      + (bool_or(m.llm_cache_storage_cost_usd IS NULL))::int
-      + (bool_or(m.tts_cost_usd IS NULL))::int
-      + (bool_or(m.stt_cost_usd IS NULL))::int
-      + (bool_or(m.exotel_cost_usd IS NULL))::int                             AS unpriced_services
+        COALESCE(a.name, '?')                                            AS agent,
+        COALESCE(m.exotel_call_duration_s, m.total_call_ms / 1000.0, 0) AS duration_s,
+        NOT COALESCE(m.is_zero_utterance, false)
+            AND COALESCE(m.exotel_call_duration_s, m.total_call_ms / 1000.0, 0) > 0 AS connected,
+        COALESCE(m.llm_cost_usd, 0)               AS llm_usd,
+        COALESCE(m.llm_cache_storage_cost_usd, 0) AS llm_cache_storage_usd,
+        COALESCE(m.tts_cost_usd, 0)               AS tts_usd,
+        COALESCE(m.stt_cost_usd, 0)               AS stt_usd,
+        COALESCE(m.exotel_cost_usd, 0)            AS telephony_usd
     FROM voice_call_metrics m
     LEFT JOIN agent a ON a.id = m.agent_id
     CROSS JOIN params p
-    WHERE m.created_at >= p.t_from
-      AND m.created_at <  p.t_to
-    GROUP BY m.agent_id, a.name
+    WHERE m.agent_id IS NOT NULL
+      AND m.created_at >= p.from_ist AT TIME ZONE 'Asia/Kolkata'
+      AND m.created_at <  p.to_ist   AT TIME ZONE 'Asia/Kolkata'
 ),
-rows AS (
-    SELECT 0 AS sort_key, agent, calls, minutes, token_coverage_pct,
-           llm_usd, llm_cache_storage_usd, tts_usd, stt_usd, telephony_usd,
-           total_stored_usd, unpriced_services
-    FROM per_agent
-    UNION ALL
-    SELECT 1, 'TOTAL', SUM(calls), SUM(minutes),
-           SUM(token_coverage_pct * calls) / NULLIF(SUM(calls), 0),
-           SUM(llm_usd), SUM(llm_cache_storage_usd), SUM(tts_usd), SUM(stt_usd),
-           SUM(telephony_usd), SUM(total_stored_usd), SUM(unpriced_services)
-    FROM per_agent
+per_agent AS (
+    SELECT
+        agent_id,
+        agent,
+        count(*)                                 AS total_calls,
+        count(*) FILTER (WHERE connected)        AS connected,
+        avg(duration_s) FILTER (WHERE connected) AS avg_duration_s,
+        sum(llm_usd)                             AS llm_usd,
+        sum(llm_cache_storage_usd)               AS llm_cache_storage_usd,
+        sum(tts_usd)                             AS tts_usd,
+        sum(stt_usd)                             AS stt_usd,
+        sum(telephony_usd)                       AS telephony_usd,
+        sum(llm_usd + llm_cache_storage_usd + tts_usd + stt_usd + telephony_usd) AS total_usd
+    FROM calls
+    GROUP BY agent_id, agent
 )
 SELECT
-    to_char(p.t_from AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD')  AS report_date,
+    to_char(p.from_ist, 'YYYY-MM-DD"T"HH24:MI:SS')                          AS period_start_ist,
+    to_char(p.to_ist,   'YYYY-MM-DD"T"HH24:MI:SS')                          AS period_end_ist,
     agent,
-    calls,
-    ROUND(minutes::numeric, 2)                                   AS minutes,
-    ROUND(token_coverage_pct::numeric, 1)                        AS token_coverage_pct,
-    ROUND(llm_usd::numeric, 4)                                   AS llm_usd,
-    ROUND(llm_cache_storage_usd::numeric, 4)                     AS llm_cache_storage_usd,
-    ROUND(tts_usd::numeric, 4)                                   AS tts_usd,
-    ROUND(stt_usd::numeric, 4)                                   AS stt_usd,
-    ROUND(telephony_usd::numeric, 4)                             AS telephony_usd,
-    ROUND(total_usd::numeric, 4)                                 AS total_usd,
-    ROUND((total_usd / NULLIF(calls, 0))::numeric, 4)            AS cost_per_call_usd,
-    ROUND((total_usd / NULLIF(minutes, 0))::numeric, 4)          AS cost_per_minute_usd,
-    ROUND(total_stored_usd::numeric, 4)                          AS total_stored_usd,
-    ROUND((total_usd - total_stored_usd)::numeric, 6)            AS drift_usd,
-    unpriced_services
-FROM (
-    SELECT r.*, llm_usd + llm_cache_storage_usd + tts_usd + stt_usd + telephony_usd AS total_usd
-    FROM rows r
-) x
+    agent_id,
+    connected                                                               AS connected_interactions,
+    ROUND(avg_duration_s::numeric, 1)                                       AS avg_duration_s,
+    ROUND((llm_usd               / NULLIF(connected, 0))::numeric, 6)       AS llm_usd_per_interaction,
+    ROUND((tts_usd               / NULLIF(connected, 0))::numeric, 6)       AS tts_usd_per_interaction,
+    ROUND((stt_usd               / NULLIF(connected, 0))::numeric, 6)       AS stt_usd_per_interaction,
+    ROUND((telephony_usd         / NULLIF(connected, 0))::numeric, 6)       AS telephony_usd_per_interaction,
+    ROUND((llm_cache_storage_usd / NULLIF(connected, 0))::numeric, 6)       AS llm_cache_storage_usd_per_interaction,
+    ROUND((total_usd             / NULLIF(connected, 0))::numeric, 6)       AS total_usd_per_interaction,
+    total_calls,
+    ROUND(total_usd::numeric, 4)                                            AS total_usd
+FROM per_agent
 CROSS JOIN params p
-ORDER BY sort_key, total_usd DESC
+ORDER BY total_usd DESC
 """
+
+
+@dataclass
+class Period:
+    name: str
+    card_name: str
+    worksheet: str
+    from_ist: str
+    to_ist: str
+    suffix: str  # appended to the headers of the columns this adds to the sheet
+
+
+PERIODS = {
+    "hourly": Period(
+        name="hourly",
+        card_name="Cost tracker - per agent, last full hour (IST)",
+        worksheet="Per 1 hour",
+        from_ist="date_trunc('hour', now() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 hour'",
+        to_ist="date_trunc('hour', now() AT TIME ZONE 'Asia/Kolkata')",
+        suffix=" (last 1 hour)",
+    ),
+    "daily": Period(
+        name="daily",
+        card_name="Cost tracker - per agent, yesterday (IST)",
+        worksheet="Per day",
+        from_ist="date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 day'",
+        to_ist="date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata')",
+        suffix="",
+    ),
+}
+
+USD = "0.000000"
+EXCEL_EPOCH = datetime(1899, 12, 30)
+
+
+def excel_serial(value: datetime) -> float:
+    """Excel date serial (days since 1899-12-30), so the cell is a real date."""
+    return (value - EXCEL_EPOCH).total_seconds() / 86400
+
+
+def hour_label(value: datetime) -> str:
+    return f"{value.hour % 12 or 12}{'am' if value.hour < 12 else 'pm'}"
+
+
+def sheet_columns(period: Period) -> list[tuple[str, str, object]]:
+    """(header, number format, row -> value). The first columns match the headers
+    already in the workbook; the rest are added to the right of them."""
+    s = period.suffix
+    start = lambda r: datetime.fromisoformat(r["period_start_ist"])
+    end = lambda r: datetime.fromisoformat(r["period_end_ist"])
+    inr = lambda key: lambda r: None if r[key] is None else round(r[key] * USD_INR_RATE, 4)
+    if period.name == "hourly":
+        lead = [
+            ("Timestamp", "yyyy-mm-dd h:mm AM/PM", lambda r: excel_serial(end(r))),
+            ("Timeframe of Analysis", "@", lambda r: f"{hour_label(start(r))} to {hour_label(end(r))}"),
+        ]
+    else:
+        lead = [("Date", "yyyy-mm-dd", lambda r: excel_serial(start(r)))]
+    field = lambda key: lambda r: r[key]
+    return lead + [
+        ("Agent", "General", field("agent")),
+        ("Agent ID", "0", field("agent_id")),
+        ("No. of Connected Interactions (last 1 hour)", "0", field("connected_interactions")),
+        ("Average Duration per interaction (last 1 hour)", "0.0", field("avg_duration_s")),
+        ("LLM - Average Cost per Interaction (last 1 hour)", USD, field("llm_usd_per_interaction")),
+        ("TTS - Average Cost per Interaction (last 1 hour)", USD, field("tts_usd_per_interaction")),
+        ("STT - Average Cost per Interaction (last 1 hour)", USD, field("stt_usd_per_interaction")),
+        # Added columns (not in the original layout).
+        (f"Telephony - Average Cost per Interaction{s}", USD, field("telephony_usd_per_interaction")),
+        (f"LLM Cache Storage - Average Cost per Interaction{s}", USD, field("llm_cache_storage_usd_per_interaction")),
+        (f"Total - Average Cost per Interaction (USD){s}", USD, field("total_usd_per_interaction")),
+        (f"Total - Average Cost per Interaction (INR){s}", "0.0000", inr("total_usd_per_interaction")),
+        (f"Total Calls{s}", "0", field("total_calls")),
+        (f"Total Cost (USD){s}", "0.0000", field("total_usd")),
+        (f"Total Cost (INR){s}", "0.00", inr("total_usd")),
+        ("USD to INR Rate", "0.00", lambda r: USD_INR_RATE),
+    ]
 
 
 def _client() -> httpx.Client:
     key = os.environ.get("METABASE_API_KEY")
     if not key:
         sys.exit("METABASE_API_KEY is not set")
-    return httpx.Client(base_url=METABASE_URL, headers={"x-api-key": key}, timeout=60)
+    return httpx.Client(base_url=METABASE_URL, headers={"x-api-key": key}, timeout=120)
 
 
-def find_card(client: httpx.Client) -> dict | None:
-    resp = client.get("/api/search", params={"q": CARD_NAME, "models": "card"})
+def find_card(client: httpx.Client, name: str) -> dict | None:
+    resp = client.get("/api/search", params={"q": name, "models": "card"})
     resp.raise_for_status()
     body = resp.json()
     results = body["data"] if isinstance(body, dict) else body
-    matches = [r for r in results if r["name"] == CARD_NAME and not r.get("archived")]
+    matches = [r for r in results if r["name"] == name and not r.get("archived")]
     return matches[0] if matches else None
 
 
-def upsert_card(client: httpx.Client, database: int, collection: int | None) -> int:
-    """Create the saved question, or update its SQL if one with CARD_NAME exists."""
+def upsert_card(client: httpx.Client, period: Period, database: int, collection: int | None) -> int:
+    """Create the period's saved question, or update its SQL if it exists."""
     dataset_query = {
         "database": database,
         "type": "native",
-        "native": {"query": COST_BY_AGENT_SQL.strip(), "template-tags": {}},
+        "native": {
+            "query": METRICS_SQL.format(from_ist=period.from_ist, to_ist=period.to_ist).strip(),
+            "template-tags": {},
+        },
     }
     description = (
-        "Yesterday's (IST) voice_call_metrics cost per agent plus a TOTAL row. "
-        "Written daily to the Cost tracker workbook (cost_tracker.py push or the Power Automate flow); managed from "
-        "Quick-reports/cost_tracker.py, so edit the SQL there."
+        f"Per-agent voice_call_metrics cost, written to the Cost Tracker workbook's "
+        f"'{period.worksheet}' sheet by Quick-reports/cost_tracker.py; edit the SQL there."
     )
-    existing = find_card(client)
+    existing = find_card(client, period.card_name)
     if existing:
         body = {"dataset_query": dataset_query, "description": description}
         if collection is not None:
@@ -166,7 +215,7 @@ def upsert_card(client: httpx.Client, database: int, collection: int | None) -> 
     resp = client.post(
         "/api/card",
         json={
-            "name": CARD_NAME,
+            "name": period.card_name,
             "description": description,
             "display": "table",
             "visualization_settings": {},
@@ -178,75 +227,63 @@ def upsert_card(client: httpx.Client, database: int, collection: int | None) -> 
     return resp.json()["id"]
 
 
-def run_card(client: httpx.Client, card_id: int) -> dict:
-    """The same call the Power Automate HTTP step makes."""
-    resp = client.post(f"/api/card/{card_id}/query", json={})
+def run_card(client: httpx.Client, period: Period) -> list[dict]:
+    card = find_card(client, period.card_name)
+    if not card:
+        sys.exit(f"No Metabase question named {period.card_name!r}; run `python cost_tracker.py cards`")
+    resp = client.post(f"/api/card/{card['id']}/query", json={})
     resp.raise_for_status()
     result = resp.json()
     if result.get("status") != "completed":
         sys.exit(f"Query failed: {result.get('error')}")
-    return result["data"]
+    cols = [c["name"] for c in result["data"]["cols"]]
+    return [dict(zip(cols, row)) for row in result["data"]["rows"]]
 
 
-def excel_serial(value: datetime) -> float:
-    """Excel date serial (days since 1899-12-30), so the cell is a real date."""
-    return (value - EXCEL_EPOCH).total_seconds() / 86400
+def sheet_rows(period: Period, results: list[dict]) -> list[list]:
+    return [[value(r) for _, _, value in sheet_columns(period)] for r in results]
 
 
-def push(client: httpx.Client, card_id: int) -> str:
-    """Run the question and write its rows to the Cost tracker, replacing any
-    rows already there for the same day."""
-    data = run_card(client, card_id)
-    index = {c["name"]: i for i, c in enumerate(data["cols"])}
-    missing = [key for _, key, _ in COST_COLUMNS if key not in index]
-    if missing:
-        sys.exit(f"Question {card_id} has no {', '.join(missing)} column(s); was its SQL changed?")
-    if not data["rows"]:
-        return "Metabase returned no rows; nothing written"
-
-    pulled_at = excel_serial(datetime.now(IST).replace(tzinfo=None))
-    rows = []
-    for r in data["rows"]:
-        row = [r[index[key]] for _, key, _ in COST_COLUMNS]
-        row[0] = excel_serial(datetime.combine(date.fromisoformat(row[0]), datetime.min.time()))
-        rows.append(row + [pulled_at])
-
+def push(client: httpx.Client, period: Period) -> str:
+    """Write the period's rows, replacing any rows already there for it."""
+    results = run_card(client, period)
+    if not results:
+        return f"No calls in the period; nothing written to {period.worksheet}"
+    columns = sheet_columns(period)
     appender = SharePointSheetAppender(
         COST_TRACKER_URL,
-        COST_WORKSHEET,
-        [header for header, _, _ in COST_COLUMNS] + [PULLED_AT],
-        number_formats=[fmt for _, _, fmt in COST_COLUMNS] + ["yyyy-mm-dd hh:mm"],
+        period.worksheet,
+        [header for header, _, _ in columns],
+        number_formats=[fmt for _, fmt, _ in columns],
     )
-    first, replaced = appender.replace_rows(rows)
-    day = data["rows"][0][index["report_date"]]
+    first, replaced = appender.replace_rows(sheet_rows(period, results))
+    span = f"{results[0]['period_start_ist']} to {results[0]['period_end_ist']}"
     verb = f"Replaced {replaced} rows with" if replaced else "Wrote"
-    return f"{verb} {len(rows)} rows for {day} at {COST_WORKSHEET}!A{first}"
+    return f"{verb} {len(results)} rows for {span} at '{period.worksheet}'!A{first}"
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
-    card = sub.add_parser("card", help="create or update the saved question")
-    card.add_argument("--database", type=int, default=COST_DATABASE_ID)
-    card.add_argument("--collection", type=int, help="Metabase collection id (default: root)")
-    preview = sub.add_parser("preview", help="run the saved question and print its rows")
-    preview.add_argument("card_id", type=int, nargs="?", default=COST_CARD_ID)
-    push_cmd = sub.add_parser("push", help="run the saved question and write it to the Cost tracker")
-    push_cmd.add_argument("card_id", type=int, nargs="?", default=COST_CARD_ID)
+    cards = sub.add_parser("cards", help="create or update both Metabase questions")
+    cards.add_argument("--database", type=int, default=COST_DATABASE_ID)
+    cards.add_argument("--collection", type=int, help="Metabase collection id (default: root)")
+    for cmd, help_text in (("preview", "print the rows push would write"), ("push", "write the rows to the workbook")):
+        sub.add_parser(cmd, help=help_text).add_argument("period", choices=PERIODS)
     args = parser.parse_args()
 
     with _client() as client:
-        if args.cmd == "card":
-            card_id = upsert_card(client, args.database, args.collection)
-            print(f"Card {card_id}: {METABASE_URL}/question/{card_id}")
-            print(f"Power Automate URI: {METABASE_URL}/api/card/{card_id}/query")
+        if args.cmd == "cards":
+            for period in PERIODS.values():
+                card_id = upsert_card(client, period, args.database, args.collection)
+                print(f"{period.name}: card {card_id} {METABASE_URL}/question/{card_id}")
         elif args.cmd == "push":
-            print(push(client, args.card_id))
+            print(push(client, PERIODS[args.period]))
         else:
-            data = run_card(client, args.card_id)
-            cols = [c["name"] for c in data["cols"]]
-            for row in data["rows"]:
-                print(json.dumps(dict(zip(cols, row))))
+            period = PERIODS[args.period]
+            headers = [header for header, _, _ in sheet_columns(period)]
+            for row in sheet_rows(period, run_card(client, period)):
+                print(json.dumps(dict(zip(headers, row))))
 
 
 if __name__ == "__main__":
