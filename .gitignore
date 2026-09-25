@@ -1,0 +1,5 @@
+.msal_cache.json
+service.log
+*.log
+__pycache__/
+.env
