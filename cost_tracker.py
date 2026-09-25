@@ -1,24 +1,60 @@
 """Daily voice-call cost by agent, as a saved Metabase question.
 
-Power Automate runs this question every morning and writes the rows into the
-Cost tracker workbook (see power_automate/README.md). This file holds the SQL
-and a small CLI to create/update the question and preview its output:
+Every morning the question's rows go into the Cost tracker workbook, either via
+`push` below (run on a schedule) or via the Power Automate flow in
+power_automate/README.md. This file holds the SQL and a small CLI:
 
     export METABASE_API_KEY=mb_...
     python cost_tracker.py card [--database 2] [--collection <id>]
-    python cost_tracker.py preview <card id>
+    python cost_tracker.py preview [<card id>]
+    python cost_tracker.py push [<card id>]     # also needs the AZURE_* vars, see sharepoint_excel.py
 """
 import argparse
 import json
 import os
 import sys
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
+
+from sharepoint_excel import SharePointSheetAppender
 
 METABASE_URL = os.getenv("METABASE_URL", "https://metabase-internal.formi.co.in")
 COST_DATABASE_ID = 2  # "Production", where voice_call_metrics lives
 
 CARD_NAME = "Voice cost by agent - yesterday (IST)"
+COST_CARD_ID = 56  # CARD_NAME on metabase-internal
+
+COST_TRACKER_URL = (
+    "https://agenticuniverse-my.sharepoint.com/:x:/g/personal/harshavardhan_agenticuniverse_ai/"
+    "IQBA8JWWiympRbBPDvSSLK2rAcaxxFXRUAjMHGlHPckptdc"
+)
+COST_WORKSHEET = "Daily Cost"
+PULLED_AT = "Pulled At (IST)"
+
+# Sheet header -> result column, with its number format. Keep in step with
+# power_automate/VoiceCostTracker.ts.
+COST_COLUMNS = [
+    ("Date", "report_date", "yyyy-mm-dd"),
+    ("Agent", "agent", "General"),
+    ("Calls", "calls", "0"),
+    ("Minutes", "minutes", "0.00"),
+    ("Token Coverage %", "token_coverage_pct", "0.0"),
+    ("LLM USD", "llm_usd", "0.0000"),
+    ("LLM Cache Storage USD", "llm_cache_storage_usd", "0.0000"),
+    ("TTS USD", "tts_usd", "0.0000"),
+    ("STT USD", "stt_usd", "0.0000"),
+    ("Telephony USD", "telephony_usd", "0.0000"),
+    ("Total USD", "total_usd", "0.0000"),
+    ("Cost per Call USD", "cost_per_call_usd", "0.0000"),
+    ("Cost per Minute USD", "cost_per_minute_usd", "0.0000"),
+    ("Total Stored USD", "total_stored_usd", "0.0000"),
+    ("Drift USD", "drift_usd", "0.000000"),
+    ("Unpriced Services", "unpriced_services", "0"),
+]
+
+IST = timezone(timedelta(hours=5, minutes=30))
+EXCEL_EPOCH = datetime(1899, 12, 30)
 
 # Yesterday (IST midnight to midnight) from voice_call_metrics, one row per
 # agent plus a TOTAL row last. report_date tags every row with the day covered.
@@ -117,7 +153,7 @@ def upsert_card(client: httpx.Client, database: int, collection: int | None) -> 
     }
     description = (
         "Yesterday's (IST) voice_call_metrics cost per agent plus a TOTAL row. "
-        "Read daily by the Cost tracker Power Automate flow; managed from "
+        "Written daily to the Cost tracker workbook (cost_tracker.py push or the Power Automate flow); managed from "
         "Quick-reports/cost_tracker.py, so edit the SQL there."
     )
     existing = find_card(client)
@@ -152,6 +188,41 @@ def run_card(client: httpx.Client, card_id: int) -> dict:
     return result["data"]
 
 
+def excel_serial(value: datetime) -> float:
+    """Excel date serial (days since 1899-12-30), so the cell is a real date."""
+    return (value - EXCEL_EPOCH).total_seconds() / 86400
+
+
+def push(client: httpx.Client, card_id: int) -> str:
+    """Run the question and write its rows to the Cost tracker, replacing any
+    rows already there for the same day."""
+    data = run_card(client, card_id)
+    index = {c["name"]: i for i, c in enumerate(data["cols"])}
+    missing = [key for _, key, _ in COST_COLUMNS if key not in index]
+    if missing:
+        sys.exit(f"Question {card_id} has no {', '.join(missing)} column(s); was its SQL changed?")
+    if not data["rows"]:
+        return "Metabase returned no rows; nothing written"
+
+    pulled_at = excel_serial(datetime.now(IST).replace(tzinfo=None))
+    rows = []
+    for r in data["rows"]:
+        row = [r[index[key]] for _, key, _ in COST_COLUMNS]
+        row[0] = excel_serial(datetime.combine(date.fromisoformat(row[0]), datetime.min.time()))
+        rows.append(row + [pulled_at])
+
+    appender = SharePointSheetAppender(
+        COST_TRACKER_URL,
+        COST_WORKSHEET,
+        [header for header, _, _ in COST_COLUMNS] + [PULLED_AT],
+        number_formats=[fmt for _, _, fmt in COST_COLUMNS] + ["yyyy-mm-dd hh:mm"],
+    )
+    first, replaced = appender.replace_rows(rows)
+    day = data["rows"][0][index["report_date"]]
+    verb = f"Replaced {replaced} rows with" if replaced else "Wrote"
+    return f"{verb} {len(rows)} rows for {day} at {COST_WORKSHEET}!A{first}"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -159,7 +230,9 @@ def main():
     card.add_argument("--database", type=int, default=COST_DATABASE_ID)
     card.add_argument("--collection", type=int, help="Metabase collection id (default: root)")
     preview = sub.add_parser("preview", help="run the saved question and print its rows")
-    preview.add_argument("card_id", type=int)
+    preview.add_argument("card_id", type=int, nargs="?", default=COST_CARD_ID)
+    push_cmd = sub.add_parser("push", help="run the saved question and write it to the Cost tracker")
+    push_cmd.add_argument("card_id", type=int, nargs="?", default=COST_CARD_ID)
     args = parser.parse_args()
 
     with _client() as client:
@@ -167,6 +240,8 @@ def main():
             card_id = upsert_card(client, args.database, args.collection)
             print(f"Card {card_id}: {METABASE_URL}/question/{card_id}")
             print(f"Power Automate URI: {METABASE_URL}/api/card/{card_id}/query")
+        elif args.cmd == "push":
+            print(push(client, args.card_id))
         else:
             data = run_card(client, args.card_id)
             cols = [c["name"] for c in data["cols"]]

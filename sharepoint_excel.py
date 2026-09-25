@@ -186,6 +186,46 @@ class SharePointSheetAppender:
             self._write_row(client, row, values, self._number_formats)
             return row
 
+    def replace_rows(self, rows: list[list]) -> tuple[int, int]:
+        """Write `rows` in place of the existing rows whose column A equals the
+        first row's column A (e.g. a date being re-run), or below the last used
+        row if there are none. Returns (first row number written, rows replaced)."""
+        key, width = rows[0][0], len(rows[0])
+        with self._client() as client:
+            self._ensure_worksheet(client)
+            self._ensure_headers(client)
+            last = max(self._last_used_row(client, width), 1)
+            matches = []
+            if last >= 2:
+                resp = client.get(f"{self._ws(client)}/range(address='A2:A{last}')?$select=values")
+                resp.raise_for_status()
+                matches = [i + 2 for i, (v,) in enumerate(resp.json()["values"]) if v == key]
+            # Delete matching runs of rows bottom-up so earlier row numbers stay valid.
+            runs: list[list[int]] = []
+            for r in matches:
+                if runs and runs[-1][1] == r - 1:
+                    runs[-1][1] = r
+                else:
+                    runs.append([r, r])
+            for start, end in reversed(runs):
+                client.post(
+                    f"{self._ws(client)}/range(address='{start}:{end}')/delete", json={"shift": "Up"}
+                ).raise_for_status()
+            if matches:
+                first = matches[0]
+                client.post(
+                    f"{self._ws(client)}/range(address='{first}:{first + len(rows) - 1}')/insert",
+                    json={"shift": "Down"},
+                ).raise_for_status()
+            else:
+                first = last + 1
+            address = f"A{first}:{self._col(width)}{first + len(rows) - 1}"
+            body = {"values": [["" if v is None else v for v in row] for row in rows]}
+            if self._number_formats:
+                body["numberFormat"] = [self._number_formats] * len(rows)
+            client.patch(f"{self._ws(client)}/range(address='{address}')", json=body).raise_for_status()
+            return first, len(matches)
+
     @staticmethod
     def _col_index(letters: str) -> int:
         n = 0

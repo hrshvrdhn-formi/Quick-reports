@@ -13,12 +13,20 @@ the results to Excel workbooks on SharePoint/OneDrive (via Microsoft Graph).
 
 Each run adds one row (a new column for `redial`) with an IST timestamp.
 
-## Cost tracker (Power Automate)
+## Cost tracker
 
-Daily voice-call cost by agent (yesterday, IST) from `voice_call_metrics` goes
-to the Cost tracker workbook through a Power Automate flow rather than this
-service. The SQL and the Metabase question CLI are in `cost_tracker.py`, and the
-Office Script plus flow setup are in [`power_automate/`](power_automate/README.md).
+Daily voice-call cost by agent (yesterday, IST) from `voice_call_metrics`
+(Metabase question 56 on the Production database) goes to the Cost tracker
+workbook, sheet **Daily Cost**, one row per agent plus TOTAL. It runs outside
+this service, as a scheduled job:
+
+```bash
+python cost_tracker.py push     # needs METABASE_API_KEY and app-only AZURE_* credentials
+```
+
+Re-running replaces that day's rows. `cost_tracker.py` also creates/updates the
+Metabase question (`card`) and prints its rows (`preview`). A Power Automate
+alternative is in [`power_automate/`](power_automate/README.md).
 
 ## Endpoints
 
