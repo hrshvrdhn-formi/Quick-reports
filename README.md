@@ -13,6 +13,13 @@ the results to Excel workbooks on SharePoint/OneDrive (via Microsoft Graph).
 
 Each run adds one row (a new column for `redial`) with an IST timestamp.
 
+## Cost tracker (Power Automate)
+
+Daily voice-call cost by agent (yesterday, IST) from `voice_call_metrics` goes
+to the Cost tracker workbook through a Power Automate flow rather than this
+service. The SQL and the Metabase question CLI are in `cost_tracker.py`, and the
+Office Script plus flow setup are in [`power_automate/`](power_automate/README.md).
+
 ## Endpoints
 
 - `GET /chola/interactions/today`
