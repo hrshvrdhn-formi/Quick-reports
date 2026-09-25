@@ -5,7 +5,7 @@ Cost tracker workbook (see power_automate/README.md). This file holds the SQL
 and a small CLI to create/update the question and preview its output:
 
     export METABASE_API_KEY=mb_...
-    python cost_tracker.py card [--database 3] [--collection <id>]
+    python cost_tracker.py card [--database 2] [--collection <id>]
     python cost_tracker.py preview <card id>
 """
 import argparse
@@ -16,12 +16,13 @@ import sys
 import httpx
 
 METABASE_URL = os.getenv("METABASE_URL", "https://metabase-internal.formi.co.in")
-METABASE_DATABASE_ID = int(os.getenv("METABASE_DATABASE_ID", "3"))  # V2_Production
+COST_DATABASE_ID = 2  # "Production", where voice_call_metrics lives
 
 CARD_NAME = "Voice cost by agent - yesterday (IST)"
 
 # Yesterday (IST midnight to midnight) from voice_call_metrics, one row per
 # agent plus a TOTAL row last. report_date tags every row with the day covered.
+# Calls with no agent_id are grouped under '(no agent_id)'.
 COST_BY_AGENT_SQL = """
 WITH params AS (
     SELECT (date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 day') AT TIME ZONE 'Asia/Kolkata' AS t_from,
@@ -30,7 +31,7 @@ WITH params AS (
 per_agent AS (
     SELECT
         m.agent_id,
-        m.agent_id || ' - ' || COALESCE(a.name, '?')                          AS agent,
+        COALESCE(m.agent_id || ' - ' || COALESCE(a.name, '?'), '(no agent_id)') AS agent,
         COUNT(*)                                                              AS calls,
         SUM(COALESCE(m.exotel_call_duration_s, m.total_call_ms / 1000.0, 0)) / 60.0 AS minutes,
         100.0 * COUNT(*) FILTER (WHERE m.llm_token_usage_source = 'actual')
@@ -155,7 +156,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     card = sub.add_parser("card", help="create or update the saved question")
-    card.add_argument("--database", type=int, default=METABASE_DATABASE_ID)
+    card.add_argument("--database", type=int, default=COST_DATABASE_ID)
     card.add_argument("--collection", type=int, help="Metabase collection id (default: root)")
     preview = sub.add_parser("preview", help="run the saved question and print its rows")
     preview.add_argument("card_id", type=int)

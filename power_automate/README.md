@@ -40,7 +40,7 @@ Unpriced Services, Pulled At (IST).
 ```bash
 pip install -r requirements.txt
 export METABASE_API_KEY=mb_...
-python cost_tracker.py card --database 3        # V2_Production; add --collection <id> to file it
+python cost_tracker.py card                     # database 2 (Production); add --collection <id> to file it
 # Card 123: https://metabase-internal.formi.co.in/question/123
 python cost_tracker.py preview 123              # the rows the flow will get
 ```
@@ -76,7 +76,7 @@ but no such table, the script stops rather than overwrite it.)
 
 2. **HTTP** (rename it to `Query Metabase`, because the expressions below use this name):
    - Method `POST`
-   - URI `https://metabase-internal.formi.co.in/api/card/<card id>/query`
+   - URI `https://metabase-internal.formi.co.in/api/card/56/query` (question [56](https://metabase-internal.formi.co.in/question/56))
    - Headers: `x-api-key` = your Metabase key, `Content-Type` = `application/json`
    - Body `{}`
    - **Settings**: turn **Asynchronous pattern** off (Metabase replies `202`),
